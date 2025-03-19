@@ -9,6 +9,7 @@ import traceback
 from typing import List
 import zipfile
 from PyPDF2 import PdfReader
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -31,10 +32,10 @@ QR_FOLDER = "exports/QR"
 os.makedirs(EXPORT_FOLDER, exist_ok=True)
 os.makedirs(QR_FOLDER, exist_ok=True)
 
-# Gmail SMTP server configuration
-SMTP_SERVER = "smtp.gmail.com"
-USERNAME = "anonhossain1710@gmail.com"  # Replace with your email
-PASSWORD = "vpge glkl pzzc dryb"  # Replace with your app-specific password
+load_dotenv()
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+USERNAME = os.getenv("USERNAME")
+PASSWORD = os.getenv("PASSWORD")
 
 # Function to count pages in a PDF file
 def count_pdf_pages(pdf_path):

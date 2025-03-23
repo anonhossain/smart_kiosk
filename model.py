@@ -9,6 +9,7 @@ class CostingItem(BaseModel):
     cost: float
 
 class User(BaseModel):
+    sl_no: int
     time_stamp: str
     name: str
     phone: str
@@ -22,5 +23,6 @@ class User(BaseModel):
     location: str
     binding_and_finishing: str
     total_cost: float
-    files: List[str]
+    files: List[str]  # URLs from Cloudinary
     is_printed: bool = Field(default=False)
+    copy_num: int

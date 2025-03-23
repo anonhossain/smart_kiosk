@@ -10,13 +10,15 @@ from typing import List
 import zipfile
 from PyPDF2 import PdfReader
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, requests
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from bson import ObjectId
 import pymongo
 import qrcode
 import uvicorn
+import cloudinary
+import cloudinary.uploader
 import pandas as pd
 from fastapi.responses import FileResponse
 from model import CostingItem, User
@@ -36,6 +38,13 @@ load_dotenv()
 SMTP_SERVER = os.getenv("SMTP_SERVER")
 USERNAME = os.getenv("USERNAME")
 PASSWORD = os.getenv("PASSWORD")
+
+cloudinary.config( 
+    cloud_name= os.getenv("cloud_name"), 
+    api_key= os.getenv("api_key"), 
+    api_secret= os.getenv("api_secret"), 
+    secure= os.getenv("secure")
+)
 
 # Function to count pages in a PDF file
 def count_pdf_pages(pdf_path):
@@ -80,7 +89,7 @@ def edit_item(item_id: str, item: CostingItem):
         return {"message": "Data updated successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
-    
+
 @app.post("/submit/")
 async def submit_user_data(
     name: str = Form(...),
@@ -91,6 +100,7 @@ async def submit_user_data(
     location: str = Form(...),
     printing_type: str = Form(...),
     binding_type: str = Form(...),
+    copy_num: int = Form(1),  # Default to 1 copy if not specified
     pdf_files: List[UploadFile] = None
 ):
     folder_path = "temp_pdfs"
@@ -99,6 +109,7 @@ async def submit_user_data(
     total_pages = 0
     saved_files = []
 
+    # Save the uploaded PDF files locally and count the pages
     for pdf_file in pdf_files:
         file_path = os.path.join(folder_path, pdf_file.filename)
         with open(file_path, "wb") as buffer:
@@ -116,18 +127,41 @@ async def submit_user_data(
     total_binding_cost = binding_type_doc['cost'] * len(saved_files)
     total_cost = total_printing_cost + total_binding_cost
 
+    # Multiply total cost by copy_num
+    total_cost *= copy_num
+
+    # Fetch last sl_no and increment
+    last_user = db.customers.find_one(sort=[("sl_no", -1)])
+    sl_no = (last_user["sl_no"] + 1) if last_user else 1
+
     customer_id = db.customers.count_documents({}) + 1
     customer_folder = os.path.join("output", str(customer_id))
     os.makedirs(customer_folder, exist_ok=True)
 
     final_saved_files = []
+    cloudinary_files = []
+    cloudinary_folder = "smart_kiosk/"
+
+    # Save the files with the name based on sl_no and upload to Cloudinary
     for idx, file_path in enumerate(saved_files, 1):
-        new_file_name = f"{customer_id}.{idx} {os.path.basename(file_path)}"
+        new_file_name = f"{sl_no}.{idx} {os.path.basename(file_path)}"  # Use sl_no and idx
         new_file_path = os.path.join(customer_folder, new_file_name)
-        shutil.move(file_path, new_file_path)
+        shutil.copy(file_path, new_file_path)  # Copy the file, not move
         final_saved_files.append(new_file_path)
 
+        # Now, upload the file to Cloudinary
+        try:
+            # Create Cloudinary public_id based on sl_no and idx
+            public_id = f"{cloudinary_folder}{sl_no}.{idx} {os.path.basename(file_path)}".replace("\\", "/")
+            upload_result = cloudinary.uploader.upload(new_file_path, resource_type="raw", public_id=public_id)
+            cloudinary_files.append(upload_result['secure_url'])  # Collect the file URL from Cloudinary
+        except Exception as e:
+            print(f"Error uploading to Cloudinary: {e}")
+            raise HTTPException(status_code=500, detail="Error uploading files to Cloudinary")
+
+    # Create the user data object
     user_data = User(
+        sl_no=sl_no,
         time_stamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         name=name,
         phone=phone,
@@ -141,29 +175,32 @@ async def submit_user_data(
         location=location,
         binding_and_finishing=binding_type,
         total_cost=total_cost,
-        files=final_saved_files,
-        is_printed=False
+        files=cloudinary_files,  # Store Cloudinary file URLs
+        is_printed=False,
+        copy_num=copy_num  # Store the copy_num value
     )
 
+    # Save user data to database
     db.customers.insert_one(user_data.dict())
-    return JSONResponse(content={"message": "User data saved successfully.", "total_cost": total_cost})
+    
+    return JSONResponse(content={"message": "User data saved successfully.", 
+                                 "total_cost": total_cost,
+                                 "Serial Number": sl_no,})
 
 @app.get("/generate-excel/")
 def generate_excel():
     collection = db["customers"]
-    # Fetch all unprinted records
     unprinted_records = list(collection.find({"is_printed": False}))
-    print("Unprinted records:", unprinted_records)
     
     if not unprinted_records:
         raise HTTPException(status_code=404, detail="No unprinted records found.")
     
-    # Extract relevant data
+    # Extract and save data into an Excel file
     data = []
-    for idx,record in enumerate(unprinted_records, start=1):
+    for record in unprinted_records:
         data.append({
-            "SL_No": idx,
             "Timestamp": record["time_stamp"],
+            "Sl_NO": record["sl_no"],
             "Name": record["name"],
             "Phone": record["phone"],
             "Email": record["email"],
@@ -175,50 +212,60 @@ def generate_excel():
             "Printing_Cost_Per_Page": record["printing_cost_per_page"],
             "Location": record["location"],
             "Binding_and_Finishing": record["binding_and_finishing"],
+            "Total_copy": record.get("copy_num", 1),
             "Total_Cost": record["total_cost"],
             "Files": ", ".join(record["files"])
-            
         })
     
-    # Create a DataFrame and save to an Excel file
     df = pd.DataFrame(data)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now().strftime('%d-%m-%Y_%H%M%S')
+    folder_name = f"unprinted_{timestamp}"
+    folder_path = os.path.join("exports", folder_name)
+    os.makedirs(folder_path, exist_ok=True)
+
     excel_filename = f"unprinted_records_{timestamp}.xlsx"
-    excel_filepath = os.path.join("exports", excel_filename)
-    os.makedirs("exports", exist_ok=True)
+    excel_filepath = os.path.join(folder_path, excel_filename)
     df.to_excel(excel_filepath, index=False)
+
+    # Download entire folder from Cloudinary as ZIP
+    zip_url = cloudinary.utils.download_folder(folder_path="smart_kiosk/")
     
+    if zip_url:
+        zip_download_path = os.path.join(folder_path, "smart_kiosk_pdfs.zip")
+        response = requests.get(zip_url, stream=True)
+        os.makedirs(os.path.dirname(zip_download_path), exist_ok=True)
+        
+        with open(zip_download_path, "wb") as zip_file:
+            for chunk in response.iter_content(chunk_size=1024):
+                zip_file.write(chunk)
+        print(f"Downloaded ZIP: {zip_download_path}")
+    else:
+        print("Failed to generate ZIP URL from Cloudinary.")
+
+    # Return a response with the folder path
+
+    try:
+        # List all PDFs under "smart_kiosk/"
+        pdfs = cloudinary.api.resources(type="upload", resource_type="raw", prefix="smart_kiosk/")
+
+        if "resources" in pdfs and pdfs["resources"]:
+            public_ids = [pdf["public_id"] for pdf in pdfs["resources"]]
+
+            # Delete all found PDFs
+            delete_result = cloudinary.api.delete_resources(public_ids, resource_type="raw", type="upload")
+            print("Deleted PDF files:", delete_result)
+        else:
+            print("No PDFs found to delete.")
+
+    except Exception as e:
+        print(f"Error deleting PDFs: {e}")
+
     # Update the is_printed field to True
-    collection.update_many({"is_printed": False}, {"$set": {"is_printed": True}})
-    
-    return FileResponse(excel_filepath, filename=excel_filename, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    collection.update_many({"is_printed": False}, 
+                           {"$set": {"is_printed": True, "sl_no": 0}})
 
-@app.put("/cleanup-printed-files/")
-def cleanup_printed_files():
-    collection = db["customers"]
-    # Fetch all records where is_printed = True
-    printed_records = list(collection.find({"is_printed": True}))
-    print(f"Found {len(printed_records)} printed records for cleanup.")
-
-    if not printed_records:
-        raise HTTPException(status_code=404, detail="No printed records found for cleanup.")
-
-    updated_count = 0
-
-    for record in printed_records:
-        file_list = record.get("files", [])
-
-        if file_list:
-            # Update MongoDB: Keep only the file names, remove file contents if stored
-            collection.update_one(
-                {"_id": record["_id"]}, 
-                {"$set": {"files": file_list}, "$unset": {"file_contents": ""}}  # Remove file contents if present
-            )
-            updated_count += 1
-
-    return {
-        "message": f"Updated {updated_count} records. Only file names are retained."
-    }
+    return {"message": "Excel and ZIP files have been generated and saved. Files Deleted Successfully", 
+            "folder_path": folder_path}
 
 @app.post("/split-excel-by-location/")
 async def split_excel_by_location(file: UploadFile = File(...)):

@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-dotenv
+PyPDF2
+pymongo
+qrcode
+pandas
+cloudinary
+python-multipart
+email-validator
+pydantic
+bson

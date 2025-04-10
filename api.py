@@ -45,6 +45,8 @@ cloudinary.config(
     api_secret= os.getenv("api_secret"), 
     secure= os.getenv("secure")
 )
+VALID_USERNAME = os.getenv("VALID_USERNAME")
+VALID_PASSWORD = os.getenv("VALID_PASSWORD")
 
 # Function to count pages in a PDF file
 def count_pdf_pages(pdf_path):
@@ -63,7 +65,14 @@ def count_pdf_pages(pdf_path):
     except Exception as e:
         print(f"Error counting pages in PDF: {e}")
         return 0
-    
+
+@app.post("/login")
+async def login(username: str = Form(...), password: str = Form(...)):
+    if username == VALID_USERNAME and password == VALID_PASSWORD:
+        return JSONResponse(content={"message": "Welcome"}, status_code=200)
+    else:
+        return JSONResponse(content={"message": "Wrong username or password"}, status_code=401)
+
 @app.post("/add_item/")
 def add_item(item: CostingItem):
     try:
